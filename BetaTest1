@@ -1,0 +1,10 @@
+--// 2/17/23
+--// Beta Test 1
+
+Reborn = true
+
+if Reborn == true then 
+    d = ''
+    else 
+        game.Players.LocalPlayer:Kick('Your reborn is outdated')
+        end
