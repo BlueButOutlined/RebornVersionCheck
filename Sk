@@ -1,0 +1,16 @@
+
+local ESP = loadstring(game:HttpGet('https://pastebin.com/raw/LiJTDVBK'))()
+
+getgenv().S = true
+
+game:GetService('RunService').RenderStepped:Connect(function()
+    
+    if getgenv().S == true then
+        ESP.Skeleton = true 
+        else 
+            ESP.Skeleton = false
+        end
+    
+ESP.Color = getgenv().Settings.Lc
+
+end)
