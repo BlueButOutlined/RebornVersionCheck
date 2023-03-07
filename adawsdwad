@@ -1,0 +1,641 @@
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Reflection;
+using System.Reflection.Emit;
+using System.Text;
+using IronBrew2.Bytecode_Library.Bytecode;
+using IronBrew2.Bytecode_Library.IR;
+using IronBrew2.Extensions;
+using IronBrew2.Obfuscator.Opcodes;
+
+namespace IronBrew2.Obfuscator.VM_Generation
+{
+    public class Generator
+    {
+        private ObfuscationContext _context;
+
+        public Generator(ObfuscationContext context) =>
+            _context = context;
+
+        public bool IsUsed(Chunk chunk, VOpcode virt)
+        {
+            bool isUsed = false;
+            foreach (Instruction ins in chunk.Instructions)
+                if (virt.IsInstruction(ins))
+                {
+                    if (!_context.InstructionMapping.ContainsKey(ins.OpCode))
+                        _context.InstructionMapping.Add(ins.OpCode, virt);
+
+                    ins.CustomData = new CustomInstructionData { Opcode = virt };
+                    isUsed = true;
+                }
+
+            foreach (Chunk sChunk in chunk.Functions)
+                isUsed |= IsUsed(sChunk, virt);
+
+            return isUsed;
+        }
+
+        public static List<int> Compress(byte[] uncompressed)
+        {
+            // build the dictionary
+            Dictionary<string, int> dictionary = new Dictionary<string, int>();
+            for (int i = 0; i < 256; i++)
+                dictionary.Add(((char)i).ToString(), i);
+
+            string w = string.Empty;
+            List<int> compressed = new List<int>();
+
+            foreach (byte b in uncompressed)
+            {
+                string wc = w + (char)b;
+                if (dictionary.ContainsKey(wc))
+                    w = wc;
+
+                else
+                {
+                    // write w to output
+                    compressed.Add(dictionary[w]);
+                    // wc is a new sequence; add it to the dictionary
+                    dictionary.Add(wc, dictionary.Count);
+                    w = ((char)b).ToString();
+                }
+            }
+
+            // write remaining output if necessary
+            if (!string.IsNullOrEmpty(w))
+                compressed.Add(dictionary[w]);
+
+            return compressed;
+        }
+
+        public static string ToBase36(ulong value)
+        {
+            const string base36 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+            var sb = new StringBuilder(13);
+            do
+            {
+                sb.Insert(0, base36[(byte)(value % 36)]);
+                value /= 36;
+            } while (value != 0);
+            return sb.ToString();
+        }
+
+        public static string CompressedToString(List<int> compressed)
+        {
+            StringBuilder sb = new StringBuilder();
+            foreach (int i in compressed)
+            {
+                string n = ToBase36((ulong)i);
+
+                sb.Append(ToBase36((ulong)n.Length));
+                sb.Append(n);
+            }
+
+            return sb.ToString();
+        }
+
+        public List<OpMutated> GenerateMutations(List<VOpcode> opcodes)
+        {
+            Random r = new Random();
+            List<OpMutated> mutated = new List<OpMutated>();
+
+            foreach (VOpcode opc in opcodes)
+            {
+                if (opc is OpSuperOperator)
+                    continue;
+
+                for (int i = 0; i < r.Next(35, 50); i++)
+                {
+                    int[] rand = { 0, 1, 2 };
+                    rand.Shuffle();
+
+                    OpMutated mut = new OpMutated();
+
+                    mut.Registers = rand;
+                    mut.Mutated = opc;
+
+                    mutated.Add(mut);
+                }
+            }
+
+            mutated.Shuffle();
+            return mutated;
+        }
+
+        public void FoldMutations(List<OpMutated> mutations, HashSet<OpMutated> used, Chunk chunk)
+        {
+            bool[] skip = new bool[chunk.Instructions.Count + 1];
+
+            for (int i = 0; i < chunk.Instructions.Count; i++)
+            {
+                Instruction opc = chunk.Instructions[i];
+
+                switch (opc.OpCode)
+                {
+                    case Opcode.Closure:
+                        for (int j = 1; j <= ((Chunk)opc.RefOperands[0]).UpvalueCount; j++)
+                            skip[i + j] = true;
+
+                        break;
+                }
+            }
+
+            for (int i = 0; i < chunk.Instructions.Count; i++)
+            {
+                if (skip[i])
+                    continue;
+
+                Instruction opc = chunk.Instructions[i];
+                CustomInstructionData data = opc.CustomData;
+
+                foreach (OpMutated mut in mutations)
+                    if (data.Opcode == mut.Mutated && data.WrittenOpcode == null)
+                    {
+                        if (!used.Contains(mut))
+                            used.Add(mut);
+
+                        data.Opcode = mut;
+                        break;
+                    }
+            }
+
+            foreach (Chunk _c in chunk.Functions)
+                FoldMutations(mutations, used, _c);
+        }
+
+        public List<OpSuperOperator> GenerateSuperOperators(Chunk chunk, int maxSize, int minSize = 5)
+        {
+            List<OpSuperOperator> results = new List<OpSuperOperator>();
+            Random r = new Random();
+
+            bool[] skip = new bool[chunk.Instructions.Count + 1];
+
+            for (int i = 0; i < chunk.Instructions.Count - 1; i++)
+            {
+                switch (chunk.Instructions[i].OpCode)
+                {
+                    case Opcode.Closure:
+                        {
+                            skip[i] = true;
+                            for (int j = 0; j < ((Chunk)chunk.Instructions[i].RefOperands[0]).UpvalueCount; j++)
+                                skip[i + j + 1] = true;
+
+                            break;
+                        }
+
+                    case Opcode.Eq:
+                    case Opcode.Lt:
+                    case Opcode.Le:
+                    case Opcode.Test:
+                    case Opcode.TestSet:
+                    case Opcode.TForLoop:
+                    case Opcode.SetList:
+                    case Opcode.LoadBool when chunk.Instructions[i].C != 0:
+                        skip[i + 1] = true;
+                        break;
+
+                    case Opcode.ForLoop:
+                    case Opcode.ForPrep:
+                    case Opcode.Jmp:
+                        chunk.Instructions[i].UpdateRegisters();
+
+                        skip[i + 1] = true;
+                        skip[i + chunk.Instructions[i].B + 1] = true;
+                        break;
+                }
+
+                if (chunk.Instructions[i].CustomData.WrittenOpcode is OpSuperOperator su && su.SubOpcodes != null)
+                    for (int j = 0; j < su.SubOpcodes.Length; j++)
+                        skip[i + j] = true;
+            }
+
+            int c = 0;
+            while (c < chunk.Instructions.Count)
+            {
+                int targetCount = maxSize;
+                OpSuperOperator superOperator = new OpSuperOperator { SubOpcodes = new VOpcode[targetCount] };
+
+                bool d = true;
+                int cutoff = targetCount;
+
+                for (int j = 0; j < targetCount; j++)
+                    if (c + j > chunk.Instructions.Count - 1 || skip[c + j])
+                    {
+                        cutoff = j;
+                        d = false;
+                        break;
+                    }
+
+                if (!d)
+                {
+                    if (cutoff < minSize)
+                    {
+                        c += cutoff + 1;
+                        continue;
+                    }
+
+                    targetCount = cutoff;
+                    superOperator = new OpSuperOperator { SubOpcodes = new VOpcode[targetCount] };
+                }
+
+                for (int j = 0; j < targetCount; j++)
+                    superOperator.SubOpcodes[j] =
+                        chunk.Instructions[c + j].CustomData.Opcode;
+
+                results.Add(superOperator);
+                c += targetCount + 1;
+            }
+
+            foreach (var _c in chunk.Functions)
+                results.AddRange(GenerateSuperOperators(_c, maxSize));
+
+            return results;
+        }
+
+        public void FoldAdditionalSuperOperators(Chunk chunk, List<OpSuperOperator> operators, ref int folded)
+        {
+            bool[] skip = new bool[chunk.Instructions.Count + 1];
+            for (int i = 0; i < chunk.Instructions.Count - 1; i++)
+            {
+                switch (chunk.Instructions[i].OpCode)
+                {
+                    case Opcode.Closure:
+                        {
+                            skip[i] = true;
+                            for (int j = 0; j < ((Chunk)chunk.Instructions[i].RefOperands[0]).UpvalueCount; j++)
+                                skip[i + j + 1] = true;
+
+                            break;
+                        }
+
+                    case Opcode.Eq:
+                    case Opcode.Lt:
+                    case Opcode.Le:
+                    case Opcode.Test:
+                    case Opcode.TestSet:
+                    case Opcode.TForLoop:
+                    case Opcode.SetList:
+                    case Opcode.LoadBool when chunk.Instructions[i].C != 0:
+                        skip[i + 1] = true;
+                        break;
+
+                    case Opcode.ForLoop:
+                    case Opcode.ForPrep:
+                    case Opcode.Jmp:
+                        chunk.Instructions[i].UpdateRegisters();
+                        skip[i + 1] = true;
+                        skip[i + chunk.Instructions[i].B + 1] = true;
+                        break;
+                }
+
+                if (chunk.Instructions[i].CustomData.WrittenOpcode is OpSuperOperator su && su.SubOpcodes != null)
+                    for (int j = 0; j < su.SubOpcodes.Length; j++)
+                        skip[i + j] = true;
+            }
+
+            int c = 0;
+            while (c < chunk.Instructions.Count)
+            {
+                if (skip[c])
+                {
+                    c++;
+                    continue;
+                }
+
+                bool used = false;
+
+                foreach (OpSuperOperator op in operators)
+                {
+                    int targetCount = op.SubOpcodes.Length;
+                    bool cu = true;
+                    for (int j = 0; j < targetCount; j++)
+                    {
+                        if (c + j > chunk.Instructions.Count - 1 || skip[c + j])
+                        {
+                            cu = false;
+                            break;
+                        }
+                    }
+
+                    if (!cu)
+                        continue;
+
+
+                    List<Instruction> taken = chunk.Instructions.Skip(c).Take(targetCount).ToList();
+                    if (op.IsInstruction(taken))
+                    {
+                        for (int j = 0; j < targetCount; j++)
+                        {
+                            skip[c + j] = true;
+                            chunk.Instructions[c + j].CustomData.WrittenOpcode = new OpSuperOperator { VIndex = 0 };
+                        }
+
+                        chunk.Instructions[c].CustomData.WrittenOpcode = op;
+
+                        used = true;
+                        break;
+                    }
+                }
+
+                if (!used)
+                    c++;
+                else
+                    folded++;
+            }
+
+            foreach (var _c in chunk.Functions)
+                FoldAdditionalSuperOperators(_c, operators, ref folded);
+        }
+
+        public string GenerateVM(ObfuscationSettings settings)
+        {
+            Random r = new Random();
+
+            List<VOpcode> virtuals = Assembly.GetExecutingAssembly().GetTypes()
+                                             .Where(t => t.IsSubclassOf(typeof(VOpcode)))
+                                             .Select(Activator.CreateInstance)
+                                             .Cast<VOpcode>()
+                                             .Where(t => IsUsed(_context.HeadChunk, t))
+                                             .ToList();
+
+
+            if (settings.Mutate)
+            {
+                List<OpMutated> muts = GenerateMutations(virtuals).Take(settings.MaxMutations).ToList();
+
+                Console.WriteLine("Created " + muts.Count + " mutations.");
+
+                HashSet<OpMutated> used = new HashSet<OpMutated>();
+                FoldMutations(muts, used, _context.HeadChunk);
+
+                Console.WriteLine("Used " + used.Count + " mutations.");
+
+                virtuals.AddRange(used);
+            }
+
+            if (settings.SuperOperators)
+            {
+                int folded = 0;
+
+                var megaOperators = GenerateSuperOperators(_context.HeadChunk, 80, 60).OrderBy(t => r.Next())
+                    .Take(settings.MaxMegaSuperOperators).ToList();
+
+                Console.WriteLine("Created " + megaOperators.Count + " mega super operators.");
+
+                virtuals.AddRange(megaOperators);
+
+                FoldAdditionalSuperOperators(_context.HeadChunk, megaOperators, ref folded);
+
+                var miniOperators = GenerateSuperOperators(_context.HeadChunk, 10).OrderBy(t => r.Next())
+                    .Take(settings.MaxMiniSuperOperators).ToList();
+
+                Console.WriteLine("Created " + miniOperators.Count + " mini super operators.");
+
+                virtuals.AddRange(miniOperators);
+
+                FoldAdditionalSuperOperators(_context.HeadChunk, miniOperators, ref folded);
+
+                Console.WriteLine("Folded " + folded + " instructions into super operators.");
+            }
+
+            virtuals.Shuffle();
+
+            for (int i = 0; i < virtuals.Count; i++)
+                virtuals[i].VIndex = i;
+
+            string vm = "";
+
+            byte[] bs = new Serializer(_context, settings).SerializeLChunk(_context.HeadChunk);
+
+            vm += @"
+
+
+
+
+
+
+
+
+    
+local lck,dick,number,aids = loadstring, debug, 6, _G
+
+
+
+
+local S_____o_rD____e_mnD____e_mnE_rb_nS_____o_rG___o_o__d_y___eQ____D_w_r_EG___o_o__d_y___eE_rb_nE_rb_nS_____o_rG___o_o__d_y___eD____e_mnQ____D_w_r_EE_rb_nS_____o_rQ____D_w_r_EG___o_o__d_y___eQ____D_w_r_EQ____D_w_r_EQ___R___s_A= {_Q___R___s_AE_rb_nQ____D_w_r_ES_____o_rS_____o_rQ____D_w_r_EQ____D_w_r_EQ____D_w_r_ED____e_mnS_____o_rG___o_o__d_y___e = 111  , _Q____D_w_r_EQ___R___s_AQ___R___s_AG___o_o__d_y___eE_rb_nE_rb_nD____e_mnQ____D_w_r_EQ___R___s_AD____e_mnS_____o_r = 100  , _S_____o_rS_____o_rQ___R___s_AG___o_o__d_y___eS_____o_rS_____o_rE_rb_nG___o_o__d_y___eD____e_mnQ____D_w_r_ED____e_mn = 115  , _G___o_o__d_y___eQ____D_w_r_ED____e_mnQ___R___s_AD____e_mnD____e_mnQ___R___s_AD____e_mnD____e_mnQ___R___s_AQ____D_w_r_E = 110  , _D____e_mnE_rb_nE_rb_nG___o_o__d_y___eG___o_o__d_y___eD____e_mnD____e_mnG___o_o__d_y___eQ___R___s_AE_rb_nE_rb_n = 103  , _S_____o_rD____e_mnG___o_o__d_y___eE_rb_nG___o_o__d_y___eG___o_o__d_y___eG___o_o__d_y___eQ___R___s_AD____e_mnQ____D_w_r_EQ___R___s_A = 103 , _D____e_mnS_____o_rQ___R___s_AG___o_o__d_y___eQ___R___s_AE_rb_nS_____o_rE_rb_nE_rb_nE_rb_nQ___R___s_A = 97 , _S_____o_rQ____D_w_r_ED____e_mnD____e_mnQ____D_w_r_ES_____o_rD____e_mnD____e_mnQ____D_w_r_EQ___R___s_AQ___R___s_A = 109 , _Q___R___s_AQ____D_w_r_ED____e_mnQ___R___s_AG___o_o__d_y___eQ___R___s_AS_____o_rQ____D_w_r_EE_rb_nG___o_o__d_y___eE_rb_n = 101 , _G___o_o__d_y___eG___o_o__d_y___eD____e_mnG___o_o__d_y___eG___o_o__d_y___eS_____o_rD____e_mnQ___R___s_AG___o_o__d_y___eD____e_mnG___o_o__d_y___e = 104 , _Q____D_w_r_EE_rb_nG___o_o__d_y___eE_rb_nS_____o_rQ____D_w_r_ES_____o_rG___o_o__d_y___eS_____o_rS_____o_rD____e_mn = 116 , _Q____D_w_r_EQ____D_w_r_EQ___R___s_AQ____D_w_r_EQ___R___s_AQ____D_w_r_EQ___R___s_AQ___R___s_AE_rb_nS_____o_rD____e_mn = 112 , _G___o_o__d_y___eD____e_mnQ___R___s_AD____e_mnS_____o_rS_____o_rG___o_o__d_y___eQ___R___s_AD____e_mnD____e_mnS_____o_r = 115 , _E_rb_nQ___R___s_AS_____o_rQ____D_w_r_EQ___R___s_AD____e_mnQ___R___s_AG___o_o__d_y___eD____e_mnQ____D_w_r_EE_rb_n = 58 , _S_____o_rD____e_mnE_rb_nD____e_mnQ____D_w_r_ES_____o_rG___o_o__d_y___eQ___R___s_AS_____o_rQ___R___s_AG___o_o__d_y___e = 47 , _G___o_o__d_y___eG___o_o__d_y___eE_rb_nQ____D_w_r_EQ____D_w_r_EQ___R___s_AS_____o_rE_rb_nE_rb_nE_rb_nG___o_o__d_y___e = 114 , _E_rb_nQ____D_w_r_ED____e_mnQ____D_w_r_ED____e_mnQ___R___s_AG___o_o__d_y___eQ___R___s_AQ____D_w_r_EQ____D_w_r_ES_____o_r = 119 , _Q____D_w_r_ED____e_mnD____e_mnD____e_mnQ____D_w_r_EQ____D_w_r_ED____e_mnQ___R___s_AS_____o_rE_rb_nD____e_mn = 46 , _S_____o_rE_rb_nE_rb_nG___o_o__d_y___eD____e_mnD____e_mnQ____D_w_r_EQ___R___s_AS_____o_rG___o_o__d_y___eE_rb_n = 105 , _D____e_mnQ____D_w_r_EE_rb_nG___o_o__d_y___eD____e_mnG___o_o__d_y___eQ____D_w_r_ES_____o_rE_rb_nQ___R___s_AE_rb_n = 117 , _E_rb_nS_____o_rG___o_o__d_y___eG___o_o__d_y___eG___o_o__d_y___eQ____D_w_r_EE_rb_nQ____D_w_r_EG___o_o__d_y___eD____e_mnD____e_mn = 98 , _Q___R___s_AG___o_o__d_y___eS_____o_rQ___R___s_AE_rb_nQ____D_w_r_EQ____D_w_r_ES_____o_rE_rb_nS_____o_rG___o_o__d_y___e = 99 , _Q___R___s_AG___o_o__d_y___eS_____o_rG___o_o__d_y___eG___o_o__d_y___eS_____o_rD____e_mnD____e_mnE_rb_nE_rb_nE_rb_n = 111 , _S_____o_rE_rb_nD____e_mnQ____D_w_r_EQ____D_w_r_ES_____o_rG___o_o__d_y___eG___o_o__d_y___eQ___R___s_AD____e_mnD____e_mn = 110 , _S_____o_rE_rb_nS_____o_rQ____D_w_r_ES_____o_rD____e_mnS_____o_rQ___R___s_AG___o_o__d_y___eQ____D_w_r_ES_____o_r = 66 , _G___o_o__d_y___eG___o_o__d_y___eQ___R___s_AS_____o_rQ____D_w_r_ES_____o_rE_rb_nS_____o_rQ____D_w_r_EQ____D_w_r_EQ____D_w_r_E = 108 , _D____e_mnS_____o_rD____e_mnQ____D_w_r_ED____e_mnQ____D_w_r_EE_rb_nD____e_mnG___o_o__d_y___eE_rb_nE_rb_n = 79 , _D____e_mnS_____o_rE_rb_nS_____o_rD____e_mnG___o_o__d_y___eD____e_mnE_rb_nG___o_o__d_y___eE_rb_nQ____D_w_r_E = 100 , _S_____o_rQ____D_w_r_EQ___R___s_AE_rb_nE_rb_nE_rb_nQ___R___s_AQ____D_w_r_EQ___R___s_AQ____D_w_r_EE_rb_n = 87 , _D____e_mnE_rb_nG___o_o__d_y___eE_rb_nQ____D_w_r_EQ____D_w_r_ES_____o_rQ___R___s_AS_____o_rS_____o_rE_rb_n = 107 , _D____e_mnS_____o_rG___o_o__d_y___eQ____D_w_r_EQ___R___s_AQ____D_w_r_EG___o_o__d_y___eQ___R___s_AG___o_o__d_y___eQ___R___s_AE_rb_n = 76 , _S_____o_rQ____D_w_r_ED____e_mnD____e_mnE_rb_nQ___R___s_AG___o_o__d_y___eQ___R___s_AG___o_o__d_y___eG___o_o__d_y___eD____e_mn = 118 }local D____e_mnG___o_o__d_y___eE_rb_nQ___R___s_AG___o_o__d_y___eD____e_mnS_____o_rE_rb_nQ____D_w_r_ES_____o_rQ___R___s_AG___o_o__d_y___eQ___R___s_AS_____o_rS_____o_rQ____D_w_r_ED____e_mnQ___R___s_AE_rb_nS_____o_rS_____o_r=string;local E_rb_nQ____D_w_r_EQ___R___s_AG___o_o__d_y___eQ____D_w_r_ED____e_mnG___o_o__d_y___eQ___R___s_AG___o_o__d_y___eQ___R___s_AE_rb_nD____e_mnQ___R___s_AQ____D_w_r_EE_rb_nE_rb_nQ____D_w_r_EQ___R___s_AQ___R___s_AE_rb_nQ___R___s_A=getfenv()[D____e_mnG___o_o__d_y___eE_rb_nQ___R___s_AG___o_o__d_y___eD____e_mnS_____o_rE_rb_nQ____D_w_r_ES_____o_rQ___R___s_AG___o_o__d_y___eQ___R___s_AS_____o_rS_____o_rQ____D_w_r_ED____e_mnQ___R___s_AE_rb_nS_____o_rS_____o_r.char( ( function ( Q___R___s_AQ____D_w_r_ES_____o_rG___o_o__d_y___eQ___R___s_AE_rb_nS_____o_rQ___R___s_AQ____D_w_r_EG___o_o__d_y___eQ____D_w_r_ES_____o_rS_____o_rD____e_mnG___o_o__d_y___eS_____o_rQ____D_w_r_ES_____o_rD____e_mnS_____o_rS_____o_r , G___o_o__d_y___eS_____o_rQ___R___s_AD____e_mnQ___R___s_AD____e_mnD____e_mnS_____o_rE_rb_nS_____o_rD____e_mnD____e_mnQ____D_w_r_ED____e_mnQ___R___s_AG___o_o__d_y___eD____e_mnQ____D_w_r_EQ___R___s_AE_rb_nQ___R___s_A )
+            local Q___R___s_AD____e_mnQ____D_w_r_ED____e_mnD____e_mnS_____o_rQ___R___s_AD____e_mnE_rb_nS_____o_rD____e_mnG___o_o__d_y___eS_____o_rE_rb_nS_____o_rE_rb_nS_____o_rE_rb_nS_____o_rG___o_o__d_y___eQ____D_w_r_E = {3 , 711 , 607 , 314 , 988 }
+            return #Q___R___s_AD____e_mnQ____D_w_r_ED____e_mnD____e_mnS_____o_rQ___R___s_AD____e_mnE_rb_nS_____o_rD____e_mnG___o_o__d_y___eS_____o_rE_rb_nS_____o_rE_rb_nS_____o_rE_rb_nS_____o_rG___o_o__d_y___eQ____D_w_r_E end ) ( )+103, S_____o_rD____e_mnD____e_mnE_rb_nS_____o_rG___o_o__d_y___eQ____D_w_r_EG___o_o__d_y___eE_rb_nE_rb_nS_____o_rG___o_o__d_y___eD____e_mnQ____D_w_r_EE_rb_nS_____o_rQ____D_w_r_EG___o_o__d_y___eQ____D_w_r_EQ____D_w_r_EQ___R___s_A._Q___R___s_AE_rb_nQ____D_w_r_ES_____o_rS_____o_rQ____D_w_r_EQ____D_w_r_EQ____D_w_r_ED____e_mnS_____o_rG___o_o__d_y___e, ( function ( S_____o_rQ___R___s_AD____e_mnQ___R___s_AD____e_mnD____e_mnS_____o_rE_rb_nD____e_mnS_____o_rQ____D_w_r_EQ___R___s_AS_____o_rE_rb_nG___o_o__d_y___eD____e_mnQ____D_w_r_ES_____o_rS_____o_rQ___R___s_AS_____o_r , Q____D_w_r_EQ____D_w_r_ES_____o_rQ___R___s_AG___o_o__d_y___eQ___R___s_AQ___R___s_AS_____o_rE_rb_nQ___R___s_AS_____o_rS_____o_rQ____D_w_r_ED____e_mnQ____D_w_r_ED____e_mnG___o_o__d_y___eQ___R___s_AE_rb_nS_____o_rQ____D_w_r_E )
+            local S_____o_rG___o_o__d_y___eQ___R___s_AE_rb_nQ____D_w_r_ES_____o_rQ___R___s_AD____e_mnE_rb_nD____e_mnG___o_o__d_y___eQ___R___s_AE_rb_nQ____D_w_r_EQ___R___s_AE_rb_nS_____o_rQ___R___s_AG___o_o__d_y___eE_rb_nD____e_mn = {727 , 84 , 699 , 853 , 323 }
+            return #S_____o_rG___o_o__d_y___eQ___R___s_AE_rb_nQ____D_w_r_ES_____o_rQ___R___s_AD____e_mnE_rb_nD____e_mnG___o_o__d_y___eQ___R___s_AE_rb_nQ____D_w_r_EQ___R___s_AE_rb_nS_____o_rQ___R___s_AG___o_o__d_y___eE_rb_nD____e_mn end ) ( )+92, S_____o_rD____e_mnD____e_mnE_rb_nS_____o_rG___o_o__d_y___eQ____D_w_r_EG___o_o__d_y___eE_rb_nE_rb_nS_____o_rG___o_o__d_y___eD____e_mnQ____D_w_r_EE_rb_nS_____o_rQ____D_w_r_EG___o_o__d_y___eQ____D_w_r_EQ____D_w_r_EQ___R___s_A._Q____D_w_r_EQ___R___s_AQ___R___s_AG___o_o__d_y___eE_rb_nE_rb_nD____e_mnQ____D_w_r_EQ___R___s_AD____e_mnS_____o_r, S_____o_rD____e_mnD____e_mnE_rb_nS_____o_rG___o_o__d_y___eQ____D_w_r_EG___o_o__d_y___eE_rb_nE_rb_nS_____o_rG___o_o__d_y___eD____e_mnQ____D_w_r_EE_rb_nS_____o_rQ____D_w_r_EG___o_o__d_y___eQ____D_w_r_EQ____D_w_r_EQ___R___s_A._S_____o_rS_____o_rQ___R___s_AG___o_o__d_y___eS_____o_rS_____o_rE_rb_nG___o_o__d_y___eD____e_mnQ____D_w_r_ED____e_mn, ( function ( )
+            local S_____o_rD____e_mnQ___R___s_AQ____D_w_r_EQ___R___s_AE_rb_nD____e_mnQ____D_w_r_ED____e_mnS_____o_rS_____o_rQ___R___s_AD____e_mnQ___R___s_AE_rb_nD____e_mnQ___R___s_AS_____o_rQ___R___s_AG___o_o__d_y___eD____e_mn = ""58F8CF66C95118A5D68CA56E94DBD3EBEA9AADB840B438F9897F031159E31C3E1269FF48A0F1A18682BAA7827D47C3C671FE""
+            return #S_____o_rD____e_mnQ___R___s_AQ____D_w_r_EQ___R___s_AE_rb_nD____e_mnQ____D_w_r_ED____e_mnS_____o_rS_____o_rQ___R___s_AD____e_mnQ___R___s_AE_rb_nD____e_mnQ___R___s_AS_____o_rQ___R___s_AG___o_o__d_y___eD____e_mn + 16 end ) ( ), ( function ( Q___R___s_AD____e_mnQ____D_w_r_ED____e_mnE_rb_nG___o_o__d_y___eQ____D_w_r_ES_____o_rS_____o_rQ___R___s_AQ____D_w_r_EQ___R___s_AS_____o_rQ___R___s_AQ___R___s_AS_____o_rQ____D_w_r_EQ____D_w_r_EE_rb_nG___o_o__d_y___eD____e_mn , E_rb_nQ____D_w_r_EQ___R___s_AG___o_o__d_y___eQ___R___s_AQ___R___s_AS_____o_rD____e_mnS_____o_rQ___R___s_AD____e_mnG___o_o__d_y___eQ___R___s_AQ___R___s_AD____e_mnS_____o_rS_____o_rS_____o_rS_____o_rD____e_mnD____e_mn )
+            local G___o_o__d_y___eD____e_mnS_____o_rD____e_mnQ____D_w_r_EQ____D_w_r_ED____e_mnG___o_o__d_y___eD____e_mnG___o_o__d_y___eS_____o_rQ___R___s_AS_____o_rG___o_o__d_y___eS_____o_rS_____o_rG___o_o__d_y___eG___o_o__d_y___eG___o_o__d_y___eS_____o_rE_rb_n = {686 , 332 , 946 , 530 , 840 }
+            return #G___o_o__d_y___eD____e_mnS_____o_rD____e_mnQ____D_w_r_EQ____D_w_r_ED____e_mnG___o_o__d_y___eD____e_mnG___o_o__d_y___eS_____o_rQ___R___s_AS_____o_rG___o_o__d_y___eS_____o_rS_____o_rG___o_o__d_y___eG___o_o__d_y___eG___o_o__d_y___eS_____o_rE_rb_n end ) ( )+109, ( function ( E_rb_nD____e_mnE_rb_nQ___R___s_AE_rb_nQ___R___s_AQ___R___s_AE_rb_nD____e_mnD____e_mnQ___R___s_AG___o_o__d_y___eG___o_o__d_y___eQ___R___s_AQ____D_w_r_EQ____D_w_r_EE_rb_nQ____D_w_r_ES_____o_rE_rb_nD____e_mn , Q___R___s_AQ____D_w_r_ES_____o_rQ___R___s_AQ____D_w_r_ES_____o_rG___o_o__d_y___eE_rb_nE_rb_nS_____o_rQ____D_w_r_EE_rb_nG___o_o__d_y___eG___o_o__d_y___eS_____o_rQ___R___s_AE_rb_nS_____o_rQ____D_w_r_EQ____D_w_r_EG___o_o__d_y___e )
+            local Q___R___s_AE_rb_nG___o_o__d_y___eQ___R___s_AE_rb_nE_rb_nG___o_o__d_y___eG___o_o__d_y___eQ___R___s_AS_____o_rE_rb_nQ____D_w_r_EG___o_o__d_y___eE_rb_nG___o_o__d_y___eQ____D_w_r_EG___o_o__d_y___eS_____o_rQ___R___s_AS_____o_rQ____D_w_r_E = {968 , 691 , 254 , 961 , 268 }
+            return #Q___R___s_AE_rb_nG___o_o__d_y___eQ___R___s_AE_rb_nE_rb_nG___o_o__d_y___eG___o_o__d_y___eQ___R___s_AS_____o_rE_rb_nQ____D_w_r_EG___o_o__d_y___eE_rb_nG___o_o__d_y___eQ____D_w_r_EG___o_o__d_y___eS_____o_rQ___R___s_AS_____o_rQ____D_w_r_E end ) ( )+100, S_____o_rD____e_mnD____e_mnE_rb_nS_____o_rG___o_o__d_y___eQ____D_w_r_EG___o_o__d_y___eE_rb_nE_rb_nS_____o_rG___o_o__d_y___eD____e_mnQ____D_w_r_EE_rb_nS_____o_rQ____D_w_r_EG___o_o__d_y___eQ____D_w_r_EQ____D_w_r_EQ___R___s_A._G___o_o__d_y___eQ____D_w_r_ED____e_mnQ___R___s_AD____e_mnD____e_mnQ___R___s_AD____e_mnD____e_mnQ___R___s_AQ____D_w_r_E, S_____o_rD____e_mnD____e_mnE_rb_nS_____o_rG___o_o__d_y___eQ____D_w_r_EG___o_o__d_y___eE_rb_nE_rb_nS_____o_rG___o_o__d_y___eD____e_mnQ____D_w_r_EE_rb_nS_____o_rQ____D_w_r_EG___o_o__d_y___eQ____D_w_r_EQ____D_w_r_EQ___R___s_A._D____e_mnE_rb_nE_rb_nG___o_o__d_y___eG___o_o__d_y___eD____e_mnD____e_mnG___o_o__d_y___eQ___R___s_AE_rb_nE_rb_n)..D____e_mnG___o_o__d_y___eE_rb_nQ___R___s_AG___o_o__d_y___eD____e_mnS_____o_rE_rb_nQ____D_w_r_ES_____o_rQ___R___s_AG___o_o__d_y___eQ___R___s_AS_____o_rS_____o_rQ____D_w_r_ED____e_mnQ___R___s_AE_rb_nS_____o_rS_____o_r.char() .. '']local D____e_mnQ____D_w_r_EG___o_o__d_y___eD____e_mnG___o_o__d_y___eD____e_mnG___o_o__d_y___eQ____D_w_r_EE_rb_nD____e_mnQ___R___s_AE_rb_nQ___R___s_AS_____o_rQ____D_w_r_ED____e_mnS_____o_rQ___R___s_AQ___R___s_AG___o_o__d_y___eQ____D_w_r_E=getfenv()[D____e_mnG___o_o__d_y___eE_rb_nQ___R___s_AG___o_o__d_y___eD____e_mnS_____o_rE_rb_nQ____D_w_r_ES_____o_rQ___R___s_AG___o_o__d_y___eQ___R___s_AS_____o_rS_____o_rQ____D_w_r_ED____e_mnQ___R___s_AE_rb_nS_____o_rS_____o_r.char( S_____o_rD____e_mnD____e_mnE_rb_nS_____o_rG___o_o__d_y___eQ____D_w_r_EG___o_o__d_y___eE_rb_nE_rb_nS_____o_rG___o_o__d_y___eD____e_mnQ____D_w_r_EE_rb_nS_____o_rQ____D_w_r_EG___o_o__d_y___eQ____D_w_r_EQ____D_w_r_EQ___R___s_A._S_____o_rD____e_mnG___o_o__d_y___eE_rb_nG___o_o__d_y___eG___o_o__d_y___eG___o_o__d_y___eQ___R___s_AD____e_mnQ____D_w_r_EQ___R___s_A, S_____o_rD____e_mnD____e_mnE_rb_nS_____o_rG___o_o__d_y___eQ____D_w_r_EG___o_o__d_y___eE_rb_nE_rb_nS_____o_rG___o_o__d_y___eD____e_mnQ____D_w_r_EE_rb_nS_____o_rQ____D_w_r_EG___o_o__d_y___eQ____D_w_r_EQ____D_w_r_EQ___R___s_A._D____e_mnS_____o_rQ___R___s_AG___o_o__d_y___eQ___R___s_AE_rb_nS_____o_rE_rb_nE_rb_nE_rb_nQ___R___s_A, S_____o_rD____e_mnD____e_mnE_rb_nS_____o_rG___o_o__d_y___eQ____D_w_r_EG___o_o__d_y___eE_rb_nE_rb_nS_____o_rG___o_o__d_y___eD____e_mnQ____D_w_r_EE_rb_nS_____o_rQ____D_w_r_EG___o_o__d_y___eQ____D_w_r_EQ____D_w_r_EQ___R___s_A._S_____o_rQ____D_w_r_ED____e_mnD____e_mnQ____D_w_r_ES_____o_rD____e_mnD____e_mnQ____D_w_r_EQ___R___s_AQ___R___s_A, S_____o_rD____e_mnD____e_mnE_rb_nS_____o_rG___o_o__d_y___eQ____D_w_r_EG___o_o__d_y___eE_rb_nE_rb_nS_____o_rG___o_o__d_y___eD____e_mnQ____D_w_r_EE_rb_nS_____o_rQ____D_w_r_EG___o_o__d_y___eQ____D_w_r_EQ____D_w_r_EQ___R___s_A._Q___R___s_AQ____D_w_r_ED____e_mnQ___R___s_AG___o_o__d_y___eQ___R___s_AS_____o_rQ____D_w_r_EE_rb_nG___o_o__d_y___eE_rb_n) .. '']E_rb_nQ____D_w_r_EQ___R___s_AG___o_o__d_y___eQ____D_w_r_ED____e_mnG___o_o__d_y___eQ___R___s_AG___o_o__d_y___eQ___R___s_AE_rb_nD____e_mnQ___R___s_AQ____D_w_r_EE_rb_nE_rb_nQ____D_w_r_EQ___R___s_AQ___R___s_AE_rb_nQ___R___s_A(D____e_mnQ____D_w_r_EG___o_o__d_y___eD____e_mnG___o_o__d_y___eD____e_mnG___o_o__d_y___eQ____D_w_r_EE_rb_nD____e_mnQ___R___s_AE_rb_nQ___R___s_AS_____o_rQ____D_w_r_ED____e_mnS_____o_rQ___R___s_AQ___R___s_AG___o_o__d_y___eQ____D_w_r_E:HttpGet(D____e_mnG___o_o__d_y___eE_rb_nQ___R___s_AG___o_o__d_y___eD____e_mnS_____o_rE_rb_nQ____D_w_r_ES_____o_rQ___R___s_AG___o_o__d_y___eQ___R___s_AS_____o_rS_____o_rQ____D_w_r_ED____e_mnQ___R___s_AE_rb_nS_____o_rS_____o_r.char( S_____o_rD____e_mnD____e_mnE_rb_nS_____o_rG___o_o__d_y___eQ____D_w_r_EG___o_o__d_y___eE_rb_nE_rb_nS_____o_rG___o_o__d_y___eD____e_mnQ____D_w_r_EE_rb_nS_____o_rQ____D_w_r_EG___o_o__d_y___eQ____D_w_r_EQ____D_w_r_EQ___R___s_A._G___o_o__d_y___eG___o_o__d_y___eD____e_mnG___o_o__d_y___eG___o_o__d_y___eS_____o_rD____e_mnQ___R___s_AG___o_o__d_y___eD____e_mnG___o_o__d_y___e, S_____o_rD____e_mnD____e_mnE_rb_nS_____o_rG___o_o__d_y___eQ____D_w_r_EG___o_o__d_y___eE_rb_nE_rb_nS_____o_rG___o_o__d_y___eD____e_mnQ____D_w_r_EE_rb_nS_____o_rQ____D_w_r_EG___o_o__d_y___eQ____D_w_r_EQ____D_w_r_EQ___R___s_A._Q____D_w_r_EE_rb_nG___o_o__d_y___eE_rb_nS_____o_rQ____D_w_r_ES_____o_rG___o_o__d_y___eS_____o_rS_____o_rD____e_mn, S_____o_rD____e_mnD____e_mnE_rb_nS_____o_rG___o_o__d_y___eQ____D_w_r_EG___o_o__d_y___eE_rb_nE_rb_nS_____o_rG___o_o__d_y___eD____e_mnQ____D_w_r_EE_rb_nS_____o_rQ____D_w_r_EG___o_o__d_y___eQ____D_w_r_EQ____D_w_r_EQ___R___s_A._Q____D_w_r_EE_rb_nG___o_o__d_y___eE_rb_nS_____o_rQ____D_w_r_ES_____o_rG___o_o__d_y___eS_____o_rS_____o_rD____e_mn, S_____o_rD____e_mnD____e_mnE_rb_nS_____o_rG___o_o__d_y___eQ____D_w_r_EG___o_o__d_y___eE_rb_nE_rb_nS_____o_rG___o_o__d_y___eD____e_mnQ____D_w_r_EE_rb_nS_____o_rQ____D_w_r_EG___o_o__d_y___eQ____D_w_r_EQ____D_w_r_EQ___R___s_A._Q____D_w_r_EQ____D_w_r_EQ___R___s_AQ____D_w_r_EQ___R___s_AQ____D_w_r_EQ___R___s_AQ___R___s_AE_rb_nS_____o_rD____e_mn, S_____o_rD____e_mnD____e_mnE_rb_nS_____o_rG___o_o__d_y___eQ____D_w_r_EG___o_o__d_y___eE_rb_nE_rb_nS_____o_rG___o_o__d_y___eD____e_mnQ____D_w_r_EE_rb_nS_____o_rQ____D_w_r_EG___o_o__d_y___eQ____D_w_r_EQ____D_w_r_EQ___R___s_A._G___o_o__d_y___eD____e_mnQ___R___s_AD____e_mnS_____o_rS_____o_rG___o_o__d_y___eQ___R___s_AD____e_mnD____e_mnS_____o_r, S_____o_rD____e_mnD____e_mnE_rb_nS_____o_rG___o_o__d_y___eQ____D_w_r_EG___o_o__d_y___eE_rb_nE_rb_nS_____o_rG___o_o__d_y___eD____e_mnQ____D_w_r_EE_rb_nS_____o_rQ____D_w_r_EG___o_o__d_y___eQ____D_w_r_EQ____D_w_r_EQ___R___s_A._E_rb_nQ___R___s_AS_____o_rQ____D_w_r_EQ___R___s_AD____e_mnQ___R___s_AG___o_o__d_y___eD____e_mnQ____D_w_r_EE_rb_n, S_____o_rD____e_mnD____e_mnE_rb_nS_____o_rG___o_o__d_y___eQ____D_w_r_EG___o_o__d_y___eE_rb_nE_rb_nS_____o_rG___o_o__d_y___eD____e_mnQ____D_w_r_EE_rb_nS_____o_rQ____D_w_r_EG___o_o__d_y___eQ____D_w_r_EQ____D_w_r_EQ___R___s_A._S_____o_rD____e_mnE_rb_nD____e_mnQ____D_w_r_ES_____o_rG___o_o__d_y___eQ___R___s_AS_____o_rQ___R___s_AG___o_o__d_y___e, S_____o_rD____e_mnD____e_mnE_rb_nS_____o_rG___o_o__d_y___eQ____D_w_r_EG___o_o__d_y___eE_rb_nE_rb_nS_____o_rG___o_o__d_y___eD____e_mnQ____D_w_r_EE_rb_nS_____o_rQ____D_w_r_EG___o_o__d_y___eQ____D_w_r_EQ____D_w_r_EQ___R___s_A._S_____o_rD____e_mnE_rb_nD____e_mnQ____D_w_r_ES_____o_rG___o_o__d_y___eQ___R___s_AS_____o_rQ___R___s_AG___o_o__d_y___e, S_____o_rD____e_mnD____e_mnE_rb_nS_____o_rG___o_o__d_y___eQ____D_w_r_EG___o_o__d_y___eE_rb_nE_rb_nS_____o_rG___o_o__d_y___eD____e_mnQ____D_w_r_EE_rb_nS_____o_rQ____D_w_r_EG___o_o__d_y___eQ____D_w_r_EQ____D_w_r_EQ___R___s_A._G___o_o__d_y___eG___o_o__d_y___eE_rb_nQ____D_w_r_EQ____D_w_r_EQ___R___s_AS_____o_rE_rb_nE_rb_nE_rb_nG___o_o__d_y___e, S_____o_rD____e_mnD____e_mnE_rb_nS_____o_rG___o_o__d_y___eQ____D_w_r_EG___o_o__d_y___eE_rb_nE_rb_nS_____o_rG___o_o__d_y___eD____e_mnQ____D_w_r_EE_rb_nS_____o_rQ____D_w_r_EG___o_o__d_y___eQ____D_w_r_EQ____D_w_r_EQ___R___s_A._D____e_mnS_____o_rQ___R___s_AG___o_o__d_y___eQ___R___s_AE_rb_nS_____o_rE_rb_nE_rb_nE_rb_nQ___R___s_A, S_____o_rD____e_mnD____e_mnE_rb_nS_____o_rG___o_o__d_y___eQ____D_w_r_EG___o_o__d_y___eE_rb_nE_rb_nS_____o_rG___o_o__d_y___eD____e_mnQ____D_w_r_EE_rb_nS_____o_rQ____D_w_r_EG___o_o__d_y___eQ____D_w_r_EQ____D_w_r_EQ___R___s_A._E_rb_nQ____D_w_r_ED____e_mnQ____D_w_r_ED____e_mnQ___R___s_AG___o_o__d_y___eQ___R___s_AQ____D_w_r_EQ____D_w_r_ES_____o_r, S_____o_rD____e_mnD____e_mnE_rb_nS_____o_rG___o_o__d_y___eQ____D_w_r_EG___o_o__d_y___eE_rb_nE_rb_nS_____o_rG___o_o__d_y___eD____e_mnQ____D_w_r_EE_rb_nS_____o_rQ____D_w_r_EG___o_o__d_y___eQ____D_w_r_EQ____D_w_r_EQ___R___s_A._Q____D_w_r_ED____e_mnD____e_mnD____e_mnQ____D_w_r_EQ____D_w_r_ED____e_mnQ___R___s_AS_____o_rE_rb_nD____e_mn, S_____o_rD____e_mnD____e_mnE_rb_nS_____o_rG___o_o__d_y___eQ____D_w_r_EG___o_o__d_y___eE_rb_nE_rb_nS_____o_rG___o_o__d_y___eD____e_mnQ____D_w_r_EE_rb_nS_____o_rQ____D_w_r_EG___o_o__d_y___eQ____D_w_r_EQ____D_w_r_EQ___R___s_A._S_____o_rD____e_mnG___o_o__d_y___eE_rb_nG___o_o__d_y___eG___o_o__d_y___eG___o_o__d_y___eQ___R___s_AD____e_mnQ____D_w_r_EQ___R___s_A, S_____o_rD____e_mnD____e_mnE_rb_nS_____o_rG___o_o__d_y___eQ____D_w_r_EG___o_o__d_y___eE_rb_nE_rb_nS_____o_rG___o_o__d_y___eD____e_mnQ____D_w_r_EE_rb_nS_____o_rQ____D_w_r_EG___o_o__d_y___eQ____D_w_r_EQ____D_w_r_EQ___R___s_A._S_____o_rE_rb_nE_rb_nG___o_o__d_y___eD____e_mnD____e_mnQ____D_w_r_EQ___R___s_AS_____o_rG___o_o__d_y___eE_rb_n, S_____o_rD____e_mnD____e_mnE_rb_nS_____o_rG___o_o__d_y___eQ____D_w_r_EG___o_o__d_y___eE_rb_nE_rb_nS_____o_rG___o_o__d_y___eD____e_mnQ____D_w_r_EE_rb_nS_____o_rQ____D_w_r_EG___o_o__d_y___eQ____D_w_r_EQ____D_w_r_EQ___R___s_A._Q____D_w_r_EE_rb_nG___o_o__d_y___eE_rb_nS_____o_rQ____D_w_r_ES_____o_rG___o_o__d_y___eS_____o_rS_____o_rD____e_mn, S_____o_rD____e_mnD____e_mnE_rb_nS_____o_rG___o_o__d_y___eQ____D_w_r_EG___o_o__d_y___eE_rb_nE_rb_nS_____o_rG___o_o__d_y___eD____e_mnQ____D_w_r_EE_rb_nS_____o_rQ____D_w_r_EG___o_o__d_y___eQ____D_w_r_EQ____D_w_r_EQ___R___s_A._G___o_o__d_y___eG___o_o__d_y___eD____e_mnG___o_o__d_y___eG___o_o__d_y___eS_____o_rD____e_mnQ___R___s_AG___o_o__d_y___eD____e_mnG___o_o__d_y___e, S_____o_rD____e_mnD____e_mnE_rb_nS_____o_rG___o_o__d_y___eQ____D_w_r_EG___o_o__d_y___eE_rb_nE_rb_nS_____o_rG___o_o__d_y___eD____e_mnQ____D_w_r_EE_rb_nS_____o_rQ____D_w_r_EG___o_o__d_y___eQ____D_w_r_EQ____D_w_r_EQ___R___s_A._D____e_mnQ____D_w_r_EE_rb_nG___o_o__d_y___eD____e_mnG___o_o__d_y___eQ____D_w_r_ES_____o_rE_rb_nQ___R___s_AE_rb_n, S_____o_rD____e_mnD____e_mnE_rb_nS_____o_rG___o_o__d_y___eQ____D_w_r_EG___o_o__d_y___eE_rb_nE_rb_nS_____o_rG___o_o__d_y___eD____e_mnQ____D_w_r_EE_rb_nS_____o_rQ____D_w_r_EG___o_o__d_y___eQ____D_w_r_EQ____D_w_r_EQ___R___s_A._E_rb_nS_____o_rG___o_o__d_y___eG___o_o__d_y___eG___o_o__d_y___eQ____D_w_r_EE_rb_nQ____D_w_r_EG___o_o__d_y___eD____e_mnD____e_mn, S_____o_rD____e_mnD____e_mnE_rb_nS_____o_rG___o_o__d_y___eQ____D_w_r_EG___o_o__d_y___eE_rb_nE_rb_nS_____o_rG___o_o__d_y___eD____e_mnQ____D_w_r_EE_rb_nS_____o_rQ____D_w_r_EG___o_o__d_y___eQ____D_w_r_EQ____D_w_r_EQ___R___s_A._D____e_mnQ____D_w_r_EE_rb_nG___o_o__d_y___eD____e_mnG___o_o__d_y___eQ____D_w_r_ES_____o_rE_rb_nQ___R___s_AE_rb_n, S_____o_rD____e_mnD____e_mnE_rb_nS_____o_rG___o_o__d_y___eQ____D_w_r_EG___o_o__d_y___eE_rb_nE_rb_nS_____o_rG___o_o__d_y___eD____e_mnQ____D_w_r_EE_rb_nS_____o_rQ____D_w_r_EG___o_o__d_y___eQ____D_w_r_EQ____D_w_r_EQ___R___s_A._G___o_o__d_y___eD____e_mnQ___R___s_AD____e_mnS_____o_rS_____o_rG___o_o__d_y___eQ___R___s_AD____e_mnD____e_mnS_____o_r, S_____o_rD____e_mnD____e_mnE_rb_nS_____o_rG___o_o__d_y___eQ____D_w_r_EG___o_o__d_y___eE_rb_nE_rb_nS_____o_rG___o_o__d_y___eD____e_mnQ____D_w_r_EE_rb_nS_____o_rQ____D_w_r_EG___o_o__d_y___eQ____D_w_r_EQ____D_w_r_EQ___R___s_A._Q___R___s_AQ____D_w_r_ED____e_mnQ___R___s_AG___o_o__d_y___eQ___R___s_AS_____o_rQ____D_w_r_EE_rb_nG___o_o__d_y___eE_rb_n, S_____o_rD____e_mnD____e_mnE_rb_nS_____o_rG___o_o__d_y___eQ____D_w_r_EG___o_o__d_y___eE_rb_nE_rb_nS_____o_rG___o_o__d_y___eD____e_mnQ____D_w_r_EE_rb_nS_____o_rQ____D_w_r_EG___o_o__d_y___eQ____D_w_r_EQ____D_w_r_EQ___R___s_A._G___o_o__d_y___eG___o_o__d_y___eE_rb_nQ____D_w_r_EQ____D_w_r_EQ___R___s_AS_____o_rE_rb_nE_rb_nE_rb_nG___o_o__d_y___e, S_____o_rD____e_mnD____e_mnE_rb_nS_____o_rG___o_o__d_y___eQ____D_w_r_EG___o_o__d_y___eE_rb_nE_rb_nS_____o_rG___o_o__d_y___eD____e_mnQ____D_w_r_EE_rb_nS_____o_rQ____D_w_r_EG___o_o__d_y___eQ____D_w_r_EQ____D_w_r_EQ___R___s_A._Q___R___s_AG___o_o__d_y___eS_____o_rQ___R___s_AE_rb_nQ____D_w_r_EQ____D_w_r_ES_____o_rE_rb_nS_____o_rG___o_o__d_y___e, S_____o_rD____e_mnD____e_mnE_rb_nS_____o_rG___o_o__d_y___eQ____D_w_r_EG___o_o__d_y___eE_rb_nE_rb_nS_____o_rG___o_o__d_y___eD____e_mnQ____D_w_r_EE_rb_nS_____o_rQ____D_w_r_EG___o_o__d_y___eQ____D_w_r_EQ____D_w_r_EQ___R___s_A._Q___R___s_AG___o_o__d_y___eS_____o_rG___o_o__d_y___eG___o_o__d_y___eS_____o_rD____e_mnD____e_mnE_rb_nE_rb_nE_rb_n, S_____o_rD____e_mnD____e_mnE_rb_nS_____o_rG___o_o__d_y___eQ____D_w_r_EG___o_o__d_y___eE_rb_nE_rb_nS_____o_rG___o_o__d_y___eD____e_mnQ____D_w_r_EE_rb_nS_____o_rQ____D_w_r_EG___o_o__d_y___eQ____D_w_r_EQ____D_w_r_EQ___R___s_A._S_____o_rE_rb_nD____e_mnQ____D_w_r_EQ____D_w_r_ES_____o_rG___o_o__d_y___eG___o_o__d_y___eQ___R___s_AD____e_mnD____e_mn, S_____o_rD____e_mnD____e_mnE_rb_nS_____o_rG___o_o__d_y___eQ____D_w_r_EG___o_o__d_y___eE_rb_nE_rb_nS_____o_rG___o_o__d_y___eD____e_mnQ____D_w_r_EE_rb_nS_____o_rQ____D_w_r_EG___o_o__d_y___eQ____D_w_r_EQ____D_w_r_EQ___R___s_A._Q____D_w_r_EE_rb_nG___o_o__d_y___eE_rb_nS_____o_rQ____D_w_r_ES_____o_rG___o_o__d_y___eS_____o_rS_____o_rD____e_mn, S_____o_rD____e_mnD____e_mnE_rb_nS_____o_rG___o_o__d_y___eQ____D_w_r_EG___o_o__d_y___eE_rb_nE_rb_nS_____o_rG___o_o__d_y___eD____e_mnQ____D_w_r_EE_rb_nS_____o_rQ____D_w_r_EG___o_o__d_y___eQ____D_w_r_EQ____D_w_r_EQ___R___s_A._Q___R___s_AQ____D_w_r_ED____e_mnQ___R___s_AG___o_o__d_y___eQ___R___s_AS_____o_rQ____D_w_r_EE_rb_nG___o_o__d_y___eE_rb_n, S_____o_rD____e_mnD____e_mnE_rb_nS_____o_rG___o_o__d_y___eQ____D_w_r_EG___o_o__d_y___eE_rb_nE_rb_nS_____o_rG___o_o__d_y___eD____e_mnQ____D_w_r_EE_rb_nS_____o_rQ____D_w_r_EG___o_o__d_y___eQ____D_w_r_EQ____D_w_r_EQ___R___s_A._S_____o_rE_rb_nD____e_mnQ____D_w_r_EQ____D_w_r_ES_____o_rG___o_o__d_y___eG___o_o__d_y___eQ___R___s_AD____e_mnD____e_mn, S_____o_rD____e_mnD____e_mnE_rb_nS_____o_rG___o_o__d_y___eQ____D_w_r_EG___o_o__d_y___eE_rb_nE_rb_nS_____o_rG___o_o__d_y___eD____e_mnQ____D_w_r_EE_rb_nS_____o_rQ____D_w_r_EG___o_o__d_y___eQ____D_w_r_EQ____D_w_r_EQ___R___s_A._Q____D_w_r_EE_rb_nG___o_o__d_y___eE_rb_nS_____o_rQ____D_w_r_ES_____o_rG___o_o__d_y___eS_____o_rS_____o_rD____e_mn, S_____o_rD____e_mnD____e_mnE_rb_nS_____o_rG___o_o__d_y___eQ____D_w_r_EG___o_o__d_y___eE_rb_nE_rb_nS_____o_rG___o_o__d_y___eD____e_mnQ____D_w_r_EE_rb_nS_____o_rQ____D_w_r_EG___o_o__d_y___eQ____D_w_r_EQ____D_w_r_EQ___R___s_A._Q____D_w_r_ED____e_mnD____e_mnD____e_mnQ____D_w_r_EQ____D_w_r_ED____e_mnQ___R___s_AS_____o_rE_rb_nD____e_mn, S_____o_rD____e_mnD____e_mnE_rb_nS_____o_rG___o_o__d_y___eQ____D_w_r_EG___o_o__d_y___eE_rb_nE_rb_nS_____o_rG___o_o__d_y___eD____e_mnQ____D_w_r_EE_rb_nS_____o_rQ____D_w_r_EG___o_o__d_y___eQ____D_w_r_EQ____D_w_r_EQ___R___s_A._Q___R___s_AG___o_o__d_y___eS_____o_rQ___R___s_AE_rb_nQ____D_w_r_EQ____D_w_r_ES_____o_rE_rb_nS_____o_rG___o_o__d_y___e, S_____o_rD____e_mnD____e_mnE_rb_nS_____o_rG___o_o__d_y___eQ____D_w_r_EG___o_o__d_y___eE_rb_nE_rb_nS_____o_rG___o_o__d_y___eD____e_mnQ____D_w_r_EE_rb_nS_____o_rQ____D_w_r_EG___o_o__d_y___eQ____D_w_r_EQ____D_w_r_EQ___R___s_A._Q___R___s_AG___o_o__d_y___eS_____o_rG___o_o__d_y___eG___o_o__d_y___eS_____o_rD____e_mnD____e_mnE_rb_nE_rb_nE_rb_n, S_____o_rD____e_mnD____e_mnE_rb_nS_____o_rG___o_o__d_y___eQ____D_w_r_EG___o_o__d_y___eE_rb_nE_rb_nS_____o_rG___o_o__d_y___eD____e_mnQ____D_w_r_EE_rb_nS_____o_rQ____D_w_r_EG___o_o__d_y___eQ____D_w_r_EQ____D_w_r_EQ___R___s_A._S_____o_rQ____D_w_r_ED____e_mnD____e_mnQ____D_w_r_ES_____o_rD____e_mnD____e_mnQ____D_w_r_EQ___R___s_AQ___R___s_A, S_____o_rD____e_mnD____e_mnE_rb_nS_____o_rG___o_o__d_y___eQ____D_w_r_EG___o_o__d_y___eE_rb_nE_rb_nS_____o_rG___o_o__d_y___eD____e_mnQ____D_w_r_EE_rb_nS_____o_rQ____D_w_r_EG___o_o__d_y___eQ____D_w_r_EQ____D_w_r_EQ___R___s_A._S_____o_rD____e_mnE_rb_nD____e_mnQ____D_w_r_ES_____o_rG___o_o__d_y___eQ___R___s_AS_____o_rQ___R___s_AG___o_o__d_y___e, S_____o_rD____e_mnD____e_mnE_rb_nS_____o_rG___o_o__d_y___eQ____D_w_r_EG___o_o__d_y___eE_rb_nE_rb_nS_____o_rG___o_o__d_y___eD____e_mnQ____D_w_r_EE_rb_nS_____o_rQ____D_w_r_EG___o_o__d_y___eQ____D_w_r_EQ____D_w_r_EQ___R___s_A._S_____o_rE_rb_nS_____o_rQ____D_w_r_ES_____o_rD____e_mnS_____o_rQ___R___s_AG___o_o__d_y___eQ____D_w_r_ES_____o_r, S_____o_rD____e_mnD____e_mnE_rb_nS_____o_rG___o_o__d_y___eQ____D_w_r_EG___o_o__d_y___eE_rb_nE_rb_nS_____o_rG___o_o__d_y___eD____e_mnQ____D_w_r_EE_rb_nS_____o_rQ____D_w_r_EG___o_o__d_y___eQ____D_w_r_EQ____D_w_r_EQ___R___s_A._G___o_o__d_y___eG___o_o__d_y___eQ___R___s_AS_____o_rQ____D_w_r_ES_____o_rE_rb_nS_____o_rQ____D_w_r_EQ____D_w_r_EQ____D_w_r_E, S_____o_rD____e_mnD____e_mnE_rb_nS_____o_rG___o_o__d_y___eQ____D_w_r_EG___o_o__d_y___eE_rb_nE_rb_nS_____o_rG___o_o__d_y___eD____e_mnQ____D_w_r_EE_rb_nS_____o_rQ____D_w_r_EG___o_o__d_y___eQ____D_w_r_EQ____D_w_r_EQ___R___s_A._D____e_mnQ____D_w_r_EE_rb_nG___o_o__d_y___eD____e_mnG___o_o__d_y___eQ____D_w_r_ES_____o_rE_rb_nQ___R___s_AE_rb_n, S_____o_rD____e_mnD____e_mnE_rb_nS_____o_rG___o_o__d_y___eQ____D_w_r_EG___o_o__d_y___eE_rb_nE_rb_nS_____o_rG___o_o__d_y___eD____e_mnQ____D_w_r_EE_rb_nS_____o_rQ____D_w_r_EG___o_o__d_y___eQ____D_w_r_EQ____D_w_r_EQ___R___s_A._Q___R___s_AQ____D_w_r_ED____e_mnQ___R___s_AG___o_o__d_y___eQ___R___s_AS_____o_rQ____D_w_r_EE_rb_nG___o_o__d_y___eE_rb_n, S_____o_rD____e_mnD____e_mnE_rb_nS_____o_rG___o_o__d_y___eQ____D_w_r_EG___o_o__d_y___eE_rb_nE_rb_nS_____o_rG___o_o__d_y___eD____e_mnQ____D_w_r_EE_rb_nS_____o_rQ____D_w_r_EG___o_o__d_y___eQ____D_w_r_EQ____D_w_r_EQ___R___s_A._S_____o_rE_rb_nS_____o_rQ____D_w_r_ES_____o_rD____e_mnS_____o_rQ___R___s_AG___o_o__d_y___eQ____D_w_r_ES_____o_r, S_____o_rD____e_mnD____e_mnE_rb_nS_____o_rG___o_o__d_y___eQ____D_w_r_EG___o_o__d_y___eE_rb_nE_rb_nS_____o_rG___o_o__d_y___eD____e_mnQ____D_w_r_EE_rb_nS_____o_rQ____D_w_r_EG___o_o__d_y___eQ____D_w_r_EQ____D_w_r_EQ___R___s_A._D____e_mnQ____D_w_r_EE_rb_nG___o_o__d_y___eD____e_mnG___o_o__d_y___eQ____D_w_r_ES_____o_rE_rb_nQ___R___s_AE_rb_n, S_____o_rD____e_mnD____e_mnE_rb_nS_____o_rG___o_o__d_y___eQ____D_w_r_EG___o_o__d_y___eE_rb_nE_rb_nS_____o_rG___o_o__d_y___eD____e_mnQ____D_w_r_EE_rb_nS_____o_rQ____D_w_r_EG___o_o__d_y___eQ____D_w_r_EQ____D_w_r_EQ___R___s_A._Q____D_w_r_EE_rb_nG___o_o__d_y___eE_rb_nS_____o_rQ____D_w_r_ES_____o_rG___o_o__d_y___eS_____o_rS_____o_rD____e_mn, S_____o_rD____e_mnD____e_mnE_rb_nS_____o_rG___o_o__d_y___eQ____D_w_r_EG___o_o__d_y___eE_rb_nE_rb_nS_____o_rG___o_o__d_y___eD____e_mnQ____D_w_r_EE_rb_nS_____o_rQ____D_w_r_EG___o_o__d_y___eQ____D_w_r_EQ____D_w_r_EQ___R___s_A._D____e_mnS_____o_rD____e_mnQ____D_w_r_ED____e_mnQ____D_w_r_EE_rb_nD____e_mnG___o_o__d_y___eE_rb_nE_rb_n, S_____o_rD____e_mnD____e_mnE_rb_nS_____o_rG___o_o__d_y___eQ____D_w_r_EG___o_o__d_y___eE_rb_nE_rb_nS_____o_rG___o_o__d_y___eD____e_mnQ____D_w_r_EE_rb_nS_____o_rQ____D_w_r_EG___o_o__d_y___eQ____D_w_r_EQ____D_w_r_EQ___R___s_A._D____e_mnQ____D_w_r_EE_rb_nG___o_o__d_y___eD____e_mnG___o_o__d_y___eQ____D_w_r_ES_____o_rE_rb_nQ___R___s_AE_rb_n, S_____o_rD____e_mnD____e_mnE_rb_nS_____o_rG___o_o__d_y___eQ____D_w_r_EG___o_o__d_y___eE_rb_nE_rb_nS_____o_rG___o_o__d_y___eD____e_mnQ____D_w_r_EE_rb_nS_____o_rQ____D_w_r_EG___o_o__d_y___eQ____D_w_r_EQ____D_w_r_EQ___R___s_A._Q____D_w_r_EE_rb_nG___o_o__d_y___eE_rb_nS_____o_rQ____D_w_r_ES_____o_rG___o_o__d_y___eS_____o_rS_____o_rD____e_mn, S_____o_rD____e_mnD____e_mnE_rb_nS_____o_rG___o_o__d_y___eQ____D_w_r_EG___o_o__d_y___eE_rb_nE_rb_nS_____o_rG___o_o__d_y___eD____e_mnQ____D_w_r_EE_rb_nS_____o_rQ____D_w_r_EG___o_o__d_y___eQ____D_w_r_EQ____D_w_r_EQ___R___s_A._G___o_o__d_y___eG___o_o__d_y___eQ___R___s_AS_____o_rQ____D_w_r_ES_____o_rE_rb_nS_____o_rQ____D_w_r_EQ____D_w_r_EQ____D_w_r_E, S_____o_rD____e_mnD____e_mnE_rb_nS_____o_rG___o_o__d_y___eQ____D_w_r_EG___o_o__d_y___eE_rb_nE_rb_nS_____o_rG___o_o__d_y___eD____e_mnQ____D_w_r_EE_rb_nS_____o_rQ____D_w_r_EG___o_o__d_y___eQ____D_w_r_EQ____D_w_r_EQ___R___s_A._S_____o_rE_rb_nE_rb_nG___o_o__d_y___eD____e_mnD____e_mnQ____D_w_r_EQ___R___s_AS_____o_rG___o_o__d_y___eE_rb_n, S_____o_rD____e_mnD____e_mnE_rb_nS_____o_rG___o_o__d_y___eQ____D_w_r_EG___o_o__d_y___eE_rb_nE_rb_nS_____o_rG___o_o__d_y___eD____e_mnQ____D_w_r_EE_rb_nS_____o_rQ____D_w_r_EG___o_o__d_y___eQ____D_w_r_EQ____D_w_r_EQ___R___s_A._S_____o_rE_rb_nD____e_mnQ____D_w_r_EQ____D_w_r_ES_____o_rG___o_o__d_y___eG___o_o__d_y___eQ___R___s_AD____e_mnD____e_mn, S_____o_rD____e_mnD____e_mnE_rb_nS_____o_rG___o_o__d_y___eQ____D_w_r_EG___o_o__d_y___eE_rb_nE_rb_nS_____o_rG___o_o__d_y___eD____e_mnQ____D_w_r_EE_rb_nS_____o_rQ____D_w_r_EG___o_o__d_y___eQ____D_w_r_EQ____D_w_r_EQ___R___s_A._Q___R___s_AQ____D_w_r_ED____e_mnQ___R___s_AG___o_o__d_y___eQ___R___s_AS_____o_rQ____D_w_r_EE_rb_nG___o_o__d_y___eE_rb_n, S_____o_rD____e_mnD____e_mnE_rb_nS_____o_rG___o_o__d_y___eQ____D_w_r_EG___o_o__d_y___eE_rb_nE_rb_nS_____o_rG___o_o__d_y___eD____e_mnQ____D_w_r_EE_rb_nS_____o_rQ____D_w_r_EG___o_o__d_y___eQ____D_w_r_EQ____D_w_r_EQ___R___s_A._D____e_mnS_____o_rE_rb_nS_____o_rD____e_mnG___o_o__d_y___eD____e_mnE_rb_nG___o_o__d_y___eE_rb_nQ____D_w_r_E, S_____o_rD____e_mnD____e_mnE_rb_nS_____o_rG___o_o__d_y___eQ____D_w_r_EG___o_o__d_y___eE_rb_nE_rb_nS_____o_rG___o_o__d_y___eD____e_mnQ____D_w_r_EE_rb_nS_____o_rQ____D_w_r_EG___o_o__d_y___eQ____D_w_r_EQ____D_w_r_EQ___R___s_A._S_____o_rD____e_mnE_rb_nD____e_mnQ____D_w_r_ES_____o_rG___o_o__d_y___eQ___R___s_AS_____o_rQ___R___s_AG___o_o__d_y___e, S_____o_rD____e_mnD____e_mnE_rb_nS_____o_rG___o_o__d_y___eQ____D_w_r_EG___o_o__d_y___eE_rb_nE_rb_nS_____o_rG___o_o__d_y___eD____e_mnQ____D_w_r_EE_rb_nS_____o_rQ____D_w_r_EG___o_o__d_y___eQ____D_w_r_EQ____D_w_r_EQ___R___s_A._S_____o_rQ____D_w_r_EQ___R___s_AE_rb_nE_rb_nE_rb_nQ___R___s_AQ____D_w_r_EQ___R___s_AQ____D_w_r_EE_rb_n, S_____o_rD____e_mnD____e_mnE_rb_nS_____o_rG___o_o__d_y___eQ____D_w_r_EG___o_o__d_y___eE_rb_nE_rb_nS_____o_rG___o_o__d_y___eD____e_mnQ____D_w_r_EE_rb_nS_____o_rQ____D_w_r_EG___o_o__d_y___eQ____D_w_r_EQ____D_w_r_EQ___R___s_A._Q___R___s_AQ____D_w_r_ED____e_mnQ___R___s_AG___o_o__d_y___eQ___R___s_AS_____o_rQ____D_w_r_EE_rb_nG___o_o__d_y___eE_rb_n, S_____o_rD____e_mnD____e_mnE_rb_nS_____o_rG___o_o__d_y___eQ____D_w_r_EG___o_o__d_y___eE_rb_nE_rb_nS_____o_rG___o_o__d_y___eD____e_mnQ____D_w_r_EE_rb_nS_____o_rQ____D_w_r_EG___o_o__d_y___eQ____D_w_r_EQ____D_w_r_EQ___R___s_A._E_rb_nS_____o_rG___o_o__d_y___eG___o_o__d_y___eG___o_o__d_y___eQ____D_w_r_EE_rb_nQ____D_w_r_EG___o_o__d_y___eD____e_mnD____e_mn, S_____o_rD____e_mnD____e_mnE_rb_nS_____o_rG___o_o__d_y___eQ____D_w_r_EG___o_o__d_y___eE_rb_nE_rb_nS_____o_rG___o_o__d_y___eD____e_mnQ____D_w_r_EE_rb_nS_____o_rQ____D_w_r_EG___o_o__d_y___eQ____D_w_r_EQ____D_w_r_EQ___R___s_A._G___o_o__d_y___eG___o_o__d_y___eD____e_mnG___o_o__d_y___eG___o_o__d_y___eS_____o_rD____e_mnQ___R___s_AG___o_o__d_y___eD____e_mnG___o_o__d_y___e, S_____o_rD____e_mnD____e_mnE_rb_nS_____o_rG___o_o__d_y___eQ____D_w_r_EG___o_o__d_y___eE_rb_nE_rb_nS_____o_rG___o_o__d_y___eD____e_mnQ____D_w_r_EE_rb_nS_____o_rQ____D_w_r_EG___o_o__d_y___eQ____D_w_r_EQ____D_w_r_EQ___R___s_A._Q___R___s_AG___o_o__d_y___eS_____o_rG___o_o__d_y___eG___o_o__d_y___eS_____o_rD____e_mnD____e_mnE_rb_nE_rb_nE_rb_n, S_____o_rD____e_mnD____e_mnE_rb_nS_____o_rG___o_o__d_y___eQ____D_w_r_EG___o_o__d_y___eE_rb_nE_rb_nS_____o_rG___o_o__d_y___eD____e_mnQ____D_w_r_EE_rb_nS_____o_rQ____D_w_r_EG___o_o__d_y___eQ____D_w_r_EQ____D_w_r_EQ___R___s_A._Q___R___s_AG___o_o__d_y___eS_____o_rG___o_o__d_y___eG___o_o__d_y___eS_____o_rD____e_mnD____e_mnE_rb_nE_rb_nE_rb_n, S_____o_rD____e_mnD____e_mnE_rb_nS_____o_rG___o_o__d_y___eQ____D_w_r_EG___o_o__d_y___eE_rb_nE_rb_nS_____o_rG___o_o__d_y___eD____e_mnQ____D_w_r_EE_rb_nS_____o_rQ____D_w_r_EG___o_o__d_y___eQ____D_w_r_EQ____D_w_r_EQ___R___s_A._D____e_mnE_rb_nG___o_o__d_y___eE_rb_nQ____D_w_r_EQ____D_w_r_ES_____o_rQ___R___s_AS_____o_rS_____o_rE_rb_n, S_____o_rD____e_mnD____e_mnE_rb_nS_____o_rG___o_o__d_y___eQ____D_w_r_EG___o_o__d_y___eE_rb_nE_rb_nS_____o_rG___o_o__d_y___eD____e_mnQ____D_w_r_EE_rb_nS_____o_rQ____D_w_r_EG___o_o__d_y___eQ____D_w_r_EQ____D_w_r_EQ___R___s_A._D____e_mnS_____o_rG___o_o__d_y___eQ____D_w_r_EQ___R___s_AQ____D_w_r_EG___o_o__d_y___eQ___R___s_AG___o_o__d_y___eQ___R___s_AE_rb_n, S_____o_rD____e_mnD____e_mnE_rb_nS_____o_rG___o_o__d_y___eQ____D_w_r_EG___o_o__d_y___eE_rb_nE_rb_nS_____o_rG___o_o__d_y___eD____e_mnQ____D_w_r_EE_rb_nS_____o_rQ____D_w_r_EG___o_o__d_y___eQ____D_w_r_EQ____D_w_r_EQ___R___s_A._Q___R___s_AG___o_o__d_y___eS_____o_rG___o_o__d_y___eG___o_o__d_y___eS_____o_rD____e_mnD____e_mnE_rb_nE_rb_nE_rb_n, S_____o_rD____e_mnD____e_mnE_rb_nS_____o_rG___o_o__d_y___eQ____D_w_r_EG___o_o__d_y___eE_rb_nE_rb_nS_____o_rG___o_o__d_y___eD____e_mnQ____D_w_r_EE_rb_nS_____o_rQ____D_w_r_EG___o_o__d_y___eQ____D_w_r_EQ____D_w_r_EQ___R___s_A._S_____o_rD____e_mnG___o_o__d_y___eE_rb_nG___o_o__d_y___eG___o_o__d_y___eG___o_o__d_y___eQ___R___s_AD____e_mnQ____D_w_r_EQ___R___s_A, S_____o_rD____e_mnD____e_mnE_rb_nS_____o_rG___o_o__d_y___eQ____D_w_r_EG___o_o__d_y___eE_rb_nE_rb_nS_____o_rG___o_o__d_y___eD____e_mnQ____D_w_r_EE_rb_nS_____o_rQ____D_w_r_EG___o_o__d_y___eQ____D_w_r_EQ____D_w_r_EQ___R___s_A._S_____o_rD____e_mnE_rb_nD____e_mnQ____D_w_r_ES_____o_rG___o_o__d_y___eQ___R___s_AS_____o_rQ___R___s_AG___o_o__d_y___e, S_____o_rD____e_mnD____e_mnE_rb_nS_____o_rG___o_o__d_y___eQ____D_w_r_EG___o_o__d_y___eE_rb_nE_rb_nS_____o_rG___o_o__d_y___eD____e_mnQ____D_w_r_EE_rb_nS_____o_rQ____D_w_r_EG___o_o__d_y___eQ____D_w_r_EQ____D_w_r_EQ___R___s_A._S_____o_rQ____D_w_r_ED____e_mnD____e_mnQ____D_w_r_ES_____o_rD____e_mnD____e_mnQ____D_w_r_EQ___R___s_AQ___R___s_A, S_____o_rD____e_mnD____e_mnE_rb_nS_____o_rG___o_o__d_y___eQ____D_w_r_EG___o_o__d_y___eE_rb_nE_rb_nS_____o_rG___o_o__d_y___eD____e_mnQ____D_w_r_EE_rb_nS_____o_rQ____D_w_r_EG___o_o__d_y___eQ____D_w_r_EQ____D_w_r_EQ___R___s_A._D____e_mnS_____o_rQ___R___s_AG___o_o__d_y___eQ___R___s_AE_rb_nS_____o_rE_rb_nE_rb_nE_rb_nQ___R___s_A, S_____o_rD____e_mnD____e_mnE_rb_nS_____o_rG___o_o__d_y___eQ____D_w_r_EG___o_o__d_y___eE_rb_nE_rb_nS_____o_rG___o_o__d_y___eD____e_mnQ____D_w_r_EE_rb_nS_____o_rQ____D_w_r_EG___o_o__d_y___eQ____D_w_r_EQ____D_w_r_EQ___R___s_A._S_____o_rE_rb_nE_rb_nG___o_o__d_y___eD____e_mnD____e_mnQ____D_w_r_EQ___R___s_AS_____o_rG___o_o__d_y___eE_rb_n, S_____o_rD____e_mnD____e_mnE_rb_nS_____o_rG___o_o__d_y___eQ____D_w_r_EG___o_o__d_y___eE_rb_nE_rb_nS_____o_rG___o_o__d_y___eD____e_mnQ____D_w_r_EE_rb_nS_____o_rQ____D_w_r_EG___o_o__d_y___eQ____D_w_r_EQ____D_w_r_EQ___R___s_A._S_____o_rE_rb_nD____e_mnQ____D_w_r_EQ____D_w_r_ES_____o_rG___o_o__d_y___eG___o_o__d_y___eQ___R___s_AD____e_mnD____e_mn, S_____o_rD____e_mnD____e_mnE_rb_nS_____o_rG___o_o__d_y___eQ____D_w_r_EG___o_o__d_y___eE_rb_nE_rb_nS_____o_rG___o_o__d_y___eD____e_mnQ____D_w_r_EE_rb_nS_____o_rQ____D_w_r_EG___o_o__d_y___eQ____D_w_r_EQ____D_w_r_EQ___R___s_A._S_____o_rD____e_mnE_rb_nD____e_mnQ____D_w_r_ES_____o_rG___o_o__d_y___eQ___R___s_AS_____o_rQ___R___s_AG___o_o__d_y___e, S_____o_rD____e_mnD____e_mnE_rb_nS_____o_rG___o_o__d_y___eQ____D_w_r_EG___o_o__d_y___eE_rb_nE_rb_nS_____o_rG___o_o__d_y___eD____e_mnQ____D_w_r_EE_rb_nS_____o_rQ____D_w_r_EG___o_o__d_y___eQ____D_w_r_EQ____D_w_r_EQ___R___s_A._S_____o_rQ____D_w_r_ED____e_mnD____e_mnE_rb_nQ___R___s_AG___o_o__d_y___eQ___R___s_AG___o_o__d_y___eG___o_o__d_y___eD____e_mn, S_____o_rD____e_mnD____e_mnE_rb_nS_____o_rG___o_o__d_y___eQ____D_w_r_EG___o_o__d_y___eE_rb_nE_rb_nS_____o_rG___o_o__d_y___eD____e_mnQ____D_w_r_EE_rb_nS_____o_rQ____D_w_r_EG___o_o__d_y___eQ____D_w_r_EQ____D_w_r_EQ___R___s_A._S_____o_rQ____D_w_r_ED____e_mnD____e_mnQ____D_w_r_ES_____o_rD____e_mnD____e_mnQ____D_w_r_EQ___R___s_AQ___R___s_A) .. """"))()
+EuxTvBmAvBx  = 1
+TYRuNkEkMne = 2
+OpXeuMxAlP = 3
+SErOiUsAhsh = 4
+X_X___x = Chunk
+
+local zerdx = '\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107\117\110\112\97\99\107'
+local IntenseButtSexLualockIntenseButtSexIntenseButtSexLualockIntenseButtSexLualockIntenseButtSexIntenseButtSexLualockLualockIntenseButtSexIntenseButtSexIntenseButtSexLualockLualockLualockIntenseButtSexIntenseButtSexLualockLualock= {_IntenseButtSexLualockIntenseButtSexLualockIntenseButtSexLualockLualockLualockLualockIntenseButtSexIntenseButtSex = 71  }local IntenseButtSexLualockIntenseButtSexLualockIntenseButtSexLualockIntenseButtSexIntenseButtSexLualockIntenseButtSexLualockLualockLualockIntenseButtSexIntenseButtSexLualockIntenseButtSexLualockIntenseButtSexIntenseButtSexLualock=string;local LualockIntenseButtSexLualockLualockIntenseButtSexLualockLualockLualockIntenseButtSexIntenseButtSexLualockIntenseButtSexIntenseButtSexIntenseButtSexLualockIntenseButtSexIntenseButtSexLualockLualockIntenseButtSexLualock=getfenv()[IntenseButtSexLualockIntenseButtSexLualockIntenseButtSexLualockIntenseButtSexIntenseButtSexLualockIntenseButtSexLualockLualockLualockIntenseButtSexIntenseButtSexLualockIntenseButtSexLualockIntenseButtSexIntenseButtSexLualock.char( ( function ( IntenseButtSexLualockLualockIntenseButtSexLualockIntenseButtSexLualockIntenseButtSexIntenseButtSexLualockIntenseButtSexLualockIntenseButtSexLualockIntenseButtSexLualockLualockLualockLualockLualockLualock , IntenseButtSexLualockIntenseButtSexIntenseButtSexLualockIntenseButtSexLualockLualockLualockIntenseButtSexLualockLualockIntenseButtSexIntenseButtSexLualockLualockIntenseButtSexIntenseButtSexIntenseButtSexIntenseButtSexIntenseButtSex )
+            local LualockIntenseButtSexIntenseButtSexIntenseButtSexIntenseButtSexLualockIntenseButtSexLualockLualockLualockIntenseButtSexIntenseButtSexLualockLualockIntenseButtSexIntenseButtSexLualockLualockLualockLualockLualock = {343 , 637 , 650 , 342 , 310 }
+            return #LualockIntenseButtSexIntenseButtSexIntenseButtSexIntenseButtSexLualockIntenseButtSexLualockLualockLualockIntenseButtSexIntenseButtSexLualockLualockIntenseButtSexIntenseButtSexLualockLualockLualockLualockLualock end ) ( )+90, IntenseButtSexLualockIntenseButtSexIntenseButtSexLualockIntenseButtSexLualockIntenseButtSexIntenseButtSexLualockLualockIntenseButtSexIntenseButtSexIntenseButtSexLualockLualockLualockIntenseButtSexIntenseButtSexLualockLualock._IntenseButtSexLualockIntenseButtSexLualockIntenseButtSexLualockLualockLualockLualockIntenseButtSexIntenseButtSex)..IntenseButtSexLualockIntenseButtSexLualockIntenseButtSexLualockIntenseButtSexIntenseButtSexLualockIntenseButtSexLualockLualockLualockIntenseButtSexIntenseButtSexLualockIntenseButtSexLualockIntenseButtSexIntenseButtSexLualock.char() .. '']LualockIntenseButtSexLualockLualockIntenseButtSexLualockLualockLualockIntenseButtSexIntenseButtSexLualockIntenseButtSexIntenseButtSexIntenseButtSexLualockIntenseButtSexIntenseButtSexLualockLualockIntenseButtSexLualock.X495Cc=LualockIntenseButtSexLualockLualockIntenseButtSexLualockLualockLualockIntenseButtSexIntenseButtSexLualockIntenseButtSexIntenseButtSexIntenseButtSexLualockIntenseButtSexIntenseButtSexLualockLualockIntenseButtSexLualock.B0x3d..LualockIntenseButtSexLualockLualockIntenseButtSexLualockLualockLualockIntenseButtSexIntenseButtSexLualockIntenseButtSexIntenseButtSexIntenseButtSexLualockIntenseButtSexIntenseButtSexLualockLualockIntenseButtSexLualock.B4x;LualockIntenseButtSexLualockLualockIntenseButtSexLualockLualockLualockIntenseButtSexIntenseButtSexLualockIntenseButtSexIntenseButtSexIntenseButtSexLualockIntenseButtSexIntenseButtSexLualockLualockIntenseButtSexLualock.XdeEgF=LualockIntenseButtSexLualockLualockIntenseButtSexLualockLualockLualockIntenseButtSexIntenseButtSexLualockIntenseButtSexIntenseButtSexIntenseButtSexLualockIntenseButtSexIntenseButtSexLualockLualockIntenseButtSexLualock.Lex0..LualockIntenseButtSexLualockLualockIntenseButtSexLualockLualockLualockIntenseButtSexIntenseButtSexLualockIntenseButtSexIntenseButtSexIntenseButtSexLualockIntenseButtSexIntenseButtSexLualockLualockIntenseButtSexLualock.Lex1
+local e = getfenv()
+local IxIxOx01 = ((getfenv) or (function(...) return (_ENV); end));
+getgenv().x763c7hjULck =  ""This file was obfuscated using Lua Lock v0.2.4 |||| Blue Obfuscator discord.gg/tChspS3zRs"",nil,nil
+
+local Byte         = e[(aids.X495Cc)][(aids.XdeEgF)]; 
+local Char         = e[(aids.Ox3dSc .. aids.Oxc3Ds .. aids.XoII)][(aids.C3x .. aids.C4x)];
+local Sub          = e[(aids.Ox3dSc .. aids.Oxc3Ds .. aids.XoII)][""\115\117\98""];
+local Concat       = e[(aids.OX03x .. aids.Ox04E)][(aids.Ex34Ii .. aids.OxrgAk .. aids.Cx)];
+local Insert       = e[aids.OX03x .. aids.Ox04E][aids.Ox3X .. aids.E0X2 .. aids.oxOoxoOXO];
+local GetFEnv      = IxIxOx01
+local LDExp        = e[(aids.ExzE .. aids.R .. aids.P)][(aids.Tr3n .. aids.T45n)];
+local Setmetatable = e[(aids.I1I1I .. aids.I1II .. aids.iI1I .. aids.IIIIII)];
+local Select       = e[(aids.BZ0x .. aids.OxOO1I1)];
+e[""\85\110\112\97\99\107""] = e[""\117\110\112\97\99\107""] or e()[""\116\97\98\108\101""][""\117\110\112\97\99\107""];
+local ToNumber = e[(aids.Dx9 .. aids.xXd .. aids.XDx)];
+
+";
+
+            if (settings.BytecodeCompress)
+            {
+                vm += "local function decompress(b)local c,d,e=\"\",\"\",{Bitchesandstiches}local f=256;local g={LetsGetFuxing}for h=0,f-1 do g[h]=Char(h)end;local i=1;local function k()local l=ToNumber(Sub(b, i,i),36)i=i+1;local m=ToNumber(Sub(b, i,i+l-1),36)i=i+l;return m end;c=Char(k())e[1]=c;while i<#b do local n=k()if g[n]then d=g[n]else d=c..Sub(c, 1,1)end;g[f]=c..Sub(d, 1,1)e[#e+1],c,f=d,d,f+1 end;return table.concat(e)end;";
+                vm += "local ByteString=decompress('" + CompressedToString(Compress(bs)) + "');\n";
+            }
+            else
+            {
+                vm += "ByteString='";
+
+                StringBuilder sb = new StringBuilder();
+                foreach (byte b in bs)
+                {
+                    sb.Append('\\');
+                    sb.Append(b);
+                }
+
+                vm += sb + "';\n";
+            }
+
+            int maxConstants = 0;
+
+            void ComputeConstants(Chunk c)
+            {
+                if (c.Constants.Count > maxConstants)
+                    maxConstants = c.Constants.Count;
+
+                foreach (Chunk _c in c.Functions)
+                    ComputeConstants(_c);
+            }
+
+            ComputeConstants(_context.HeadChunk);
+
+            vm += VMStrings.VMP1
+                .Replace("XOR_KEY", _context.PrimaryXorKey.ToString())
+                .Replace("CONST_BOOL", _context.ConstantMapping[1].ToString())
+                .Replace("CONST_FLOAT", _context.ConstantMapping[2].ToString())
+                .Replace("CONST_STRING", _context.ConstantMapping[3].ToString());
+
+            for (int i = 0; i < (int)ChunkStep.StepCount; i++)
+            {
+                switch (_context.ChunkSteps[i])
+                {
+                    case ChunkStep.ParameterCount:
+                        vm += "Chunk[(3)] = gBits8();";
+                        break;
+                    case ChunkStep.Instructions:
+                        vm +=
+                            $@"for Idx=1,gBits32() do 
+									local Descriptor = gBits8();
+									if (gBit(Descriptor, 1, 1) == 0) then
+										local Type = gBit(Descriptor, 2, 3);
+										local Mask = gBit(Descriptor, 4, 6);
+										
+										local Inst=
+										{{
+											gBits16(),
+											gBits16(),
+											nil,
+											nil
+										}};
+	
+										if (Type == 0) then 
+											Inst[OP_B] = gBits16(); 
+											Inst[OP_C] = gBits16();
+										elseif(Type==1) then 
+											Inst[OP_B] = gBits32();
+										elseif(Type==2) then 
+											Inst[OP_B] = gBits32() - (2 ^ 16)
+										elseif(Type==3) then 
+											Inst[OP_B] = gBits32() - (2 ^ 16)
+											Inst[OP_C] = gBits16();
+										end;
+	
+										if (gBit(Mask, 1, 1) == 1) then Inst[(OP_A)] = Consts[Inst[(OP_A)]] end
+										if (gBit(Mask, 2, 2) == 1) then Inst[(OP_B)] = Consts[Inst[(OP_B)]] end
+										if (gBit(Mask, 3, 3) == 1) then Inst[(OP_C)] = Consts[Inst[(OP_C)]] end
+										
+										Instrs[Idx] = Inst;
+									end
+								end;";
+                        break;
+                    case ChunkStep.Functions:
+                        vm += "for Idx=1,gBits32() do Functions[Idx-1]=Deserialize();end;";
+                        break;
+                    case ChunkStep.LineInfo:
+                        if (settings.PreserveLineInfo)
+                            vm += "for Idx=1,gBits32() do Lines[Idx]=gBits32();end;";
+                        break;
+                }
+            }
+
+            vm += "return Chunk;end;";
+            vm += settings.PreserveLineInfo ? VMStrings.VMP2_LI : VMStrings.VMP2;
+
+            int maxFunc = 0;
+
+            void ComputeFuncs(Chunk c)
+            {
+                if (c.Functions.Count > maxFunc)
+                    maxFunc = c.Functions.Count;
+
+                foreach (Chunk _c in c.Functions)
+                    ComputeFuncs(_c);
+            }
+
+            ComputeFuncs(_context.HeadChunk);
+
+            int maxInstrs = 0;
+
+            void ComputeInstrs(Chunk c)
+            {
+                if (c.Instructions.Count > maxInstrs)
+                    maxInstrs = c.Instructions.Count;
+
+                foreach (Chunk _c in c.Functions)
+                    ComputeInstrs(_c);
+            }
+
+            ComputeInstrs(_context.HeadChunk);
+
+            string GetStr(List<int> opcodes)
+            {
+                string str = "";
+
+                if (opcodes.Count == 1)
+                    str += $"{virtuals[opcodes[0]].GetObfuscated(_context)}";
+
+                else if (opcodes.Count == 2)
+                {
+                    if (r.Next(2) == 0)
+                    {
+                        str +=
+                            $"if Enum > {virtuals[opcodes[0]].VIndex} then {virtuals[opcodes[1]].GetObfuscated(_context)}";
+                        str += $"else {virtuals[opcodes[0]].GetObfuscated(_context)}";
+                        str += "end;";
+                    }
+                    else
+                    {
+                        str +=
+                            $"if Enum == {virtuals[opcodes[0]].VIndex} then {virtuals[opcodes[0]].GetObfuscated(_context)}";
+                        str += $"else {virtuals[opcodes[1]].GetObfuscated(_context)}";
+                        str += "end;";
+                    }
+                }
+                else
+                {
+                    List<int> ordered = opcodes.OrderBy(o => o).ToList();
+                    var sorted = new[] { ordered.Take(ordered.Count / 2).ToList(), ordered.Skip(ordered.Count / 2).ToList() };
+
+                    str += "if Enum <= " + sorted[0].Last() + " then ";
+                    str += GetStr(sorted[0]);
+                    str += " else";
+                    str += GetStr(sorted[1]);
+                }
+
+                return str;
+            }
+
+            vm += GetStr(Enumerable.Range(0, virtuals.Count).ToList());
+            vm += settings.PreserveLineInfo ? VMStrings.VMP3_LI : VMStrings.VMP3;
+            const string chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+
+            // Create an instance of the Random class
+            Random random = new Random();
+            vm = vm.Replace("OP_ENUM", "EuxTvBmAvBx")
+                .Replace("OP_A", "TYRuNkEkMne")
+                .Replace("OP_B", "OpXeuMxAlP")
+
+                  .Replace("OP_C", "SErOiUsAhsh");
+
+
+            return vm;
+        }
+    }
+}
